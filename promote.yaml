@@ -1,0 +1,200 @@
+version: '1.0'
+stages:
+- build
+- promote
+steps:
+  main_clone:
+    stage: build
+    title: 'Cloning main repository...'
+    type: git-clone
+    repo: codefresh-io/${{CF_REPO_NAME}}
+    revision: ${{CF_PULL_REQUEST_MERGED_COMMIT_SHA}} 
+    git: cf_github
+    when:
+      condition:
+        all:
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+          pullRequestMerged: '"${{CF_PULL_REQUEST_MERGED}}" == "true"'
+
+  validate_pr:
+    stage: promote
+    title: "Validate PR merged"
+    image: golang:alpine
+    commands:
+    - |
+      apk update
+      apk add jq git
+      go get github.com/github/hub
+
+      export PR_DATA=$(hub pr list -s merged -f "%i %sH %H %pS%n" | grep "#$CF_PULL_REQUEST_NUMBER ")
+
+
+      if [ -z "$PR_DATA" ]
+      then
+        echo "PR not found or not merged"
+        cf_export IS_MERGED=false
+      else
+        echo "PR merged!"
+        cf_export IS_MERGED=true
+      fi
+      cf_export CF_HEAD_REVISION=$(echo $PR_DATA | awk '{print $2}')
+      cf_export CF_HEAD_BRANCH=$(echo $PR_DATA | awk '{print $3}')
+    when:
+      condition:
+        all:
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+
+  prepare_environment_variabels:
+    stage: build
+    title: 'Prepare environment variables'
+    image: codefresh/cli
+    commands:
+    - cf_export PACKAGE_VERSION=$(if [  -f VERSION ]; then cat VERSION; else yq -r ".version" service.yaml; fi;)
+    - cf_export CHART_NAME=$(ls .deploy)
+    - export HELM_REPO_URL=http://chartmuseum.codefresh.io
+    - cf_export HELM_REPO_FULL_PATH=$HELM_REPO_URL/api/charts
+    when:
+      steps:
+      - name: main_clone
+        on:
+        - success
+
+#   validate_version:
+#     stage: promote
+#     title: "Validate version"
+#     image: codefresh/cli
+#     commands:
+#     - export IMAGE_ID=$(codefresh get img --image-name codefresh/${{CF_REPO_NAME}} --tag ${{PACKAGE_VERSION}})
+#     - echo "Validate that there is no image with tag $PACKAGE_VERSION"
+#     - echo $IMAGE_ID
+#     - if [ "$IMAGE_ID" == "no available resources" ]; then exit 0; else exit 1; fi;
+#     when:
+#       condition:
+#         all:
+#           pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+#           pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+
+
+  buildingDockerImage:
+    title: Building Docker Image
+    type: build
+    stage: promote
+    working_directory: ./
+    image_name: codefresh/${{CF_REPO_NAME}}
+    tag: master
+    dockerfile:
+      content: |-
+        FROM r.cfcr.io/codefresh-inc/codefresh/${{CF_REPO_NAME}}:${{CF_HEAD_REVISION}}
+    when:
+      condition:
+        all:
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+
+  push_to_cfcr:
+    title: 'Pushing image to cfcr'
+    stage: promote
+    type: push
+    image_name: codefresh/${{CF_REPO_NAME}}
+    registry: CFCR
+    candidate: ${{buildingDockerImage}}
+    tags:
+    - ${{PACKAGE_VERSION}}
+    - ${{CF_PULL_REQUEST_MERGED_COMMIT_SHA}}
+    when:
+      condition:
+        all:
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+
+
+  build_helm_package:
+    stage: promote
+    image: codefresh/kube-helm:master
+    commands:
+    # update imageTag in values.yaml
+    - yq '.imageTag = env.PACKAGE_VERSION' ${{CF_VOLUME_PATH}}/${{CF_REPO_NAME}}/.deploy/${{CHART_NAME}}/values.yaml --yaml-output > ${{CF_VOLUME_PATH}}/values.new.yaml
+    - mv ${{CF_VOLUME_PATH}}/values.new.yaml ${{CF_VOLUME_PATH}}/${{CF_REPO_NAME}}/.deploy/${{CHART_NAME}}/values.yaml
+
+    - helm dependency update ${{CF_VOLUME_PATH}}/${{CF_REPO_NAME}}/.deploy/${{CHART_NAME}}
+
+    - export PACKAGE=$(helm package ${{CF_VOLUME_PATH}}/${{CF_REPO_NAME}}/.deploy/${{CHART_NAME}} --version ${{PACKAGE_VERSION}} --destination ${{CF_VOLUME_PATH}} | cut -d " " -f 8 )
+    - curl --user ${{BASIC_AUTH_USER}}:${{BASIC_AUTH_PASS}} --fail --data-binary "@$PACKAGE" $HELM_REPO_FULL_PATH
+    when:
+      condition:
+        all:
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+          
+          
+  create_git_release:
+    stage: promote
+    title: "Creating git release"
+    image: golang:alpine
+    commands:
+    - |
+      apk update
+      apk add jq git
+      go get github.com/github/hub
+
+      export RELEASE=$(hub release show $PACKAGE_VERSION || echo "NOT_EXISTS")
+      if [  "$RELEASE" == "NOT_EXISTS" ]; then hub release create $PACKAGE_VERSION -m "$PACKAGE_VERSION";fi;
+      hub release edit $PACKAGE_VERSION -m "$PACKAGE_VERSION" -m "Chart URL: https://g.codefresh.io/helm/charts/codefresh_stable/${{CF_REPO_NAME}}" -m "Build URL: ${{CF_BUILD_URL}}"
+
+    when:
+      condition:
+        all:
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+
+  delete_branch:
+    stage: promote
+    title: "delete branch"
+    image: codefresh/cli
+    fail_fast: false
+    commands:
+    - |
+      # get the github credentials
+      codefresh get ctx cf_github --decrypt -o yaml > github.yaml
+      export GITHUB_TOKEN=$(yq -r ".spec.data.auth.password" github.yaml)
+      echo "$GITHUB_TOKEN"
+      echo "${{CF_REPO_NAME}}"
+      git remote add remote https://$GITHUB_TOKEN@github.com/codefresh-io/${{CF_REPO_NAME}}.git || true
+      git config --global user.email "automation@codefresh.io"
+      git config --global user.name "Automation"
+      git push --delete remote ${{CF_HEAD_BRANCH}}
+    when:
+      steps:
+      - name: build_helm_package
+        on:
+        - success
+      condition:
+        all:
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+          
+  # deploy:
+  #   stage: promote
+  #   image: node:${{RUNTIME_VERSION}}
+  #   commands:
+  #   - yarn deploy
+  #   when:
+  #     condition:
+  #       all:
+  #         pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+  #         pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'
+
+  run_cd_pipeline:
+    stage: promote
+    image: codefresh/cli
+    commands:
+    - codefresh run ${{PRODUCTION_PIPELINE_NAME}} -b master -v ENVIRONMENT=production --detach --rv --trigger production
+    when:
+      steps:
+      - name: build_helm_package
+        on:
+        - success
+      condition:
+        all:
+          pullRequestMerged: '"${{IS_MERGED}}" == "true"'
+          pullRequestTargetMaster: '"${{CF_PULL_REQUEST_TARGET}}" == "master"'

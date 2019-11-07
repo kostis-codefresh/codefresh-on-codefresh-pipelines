@@ -1,0 +1,173 @@
+version: '1.0'
+stages:
+- prepare
+- deploy
+- notifications
+steps:
+
+  wait:
+    stage: prepare
+    image: codefresh/cli
+    commands:
+    - echo "CF_BUILD_INITIATOR:$CF_BUILD_INITIATOR"
+    - echo "Current build id:$CF_BUILD_ID"
+    - echo "Current trigger id:$CF_PIPELINE_TRIGGER_ID"
+    # Verify if there's more than 1 running builds, if so, wait for the first to finish
+    - while [ $(codefresh get builds --status=running --pipeline-name="codefresh-io/pipelines/cd" --pipeline-trigger-id ${{CF_PIPELINE_TRIGGER_ID}} | wc -l) -gt 1 -a $(codefresh get builds --status=running --pipeline-name="codefresh-io/pipelines/cd" --pipeline-trigger-id ${{CF_PIPELINE_TRIGGER_ID}} |awk '{print $1}'|egrep -v "ID|no available"|awk 'END{print}') != $CF_BUILD_ID ]; do echo waiting; done
+
+  check_deployment_status:
+    stage: prepare
+    image: codefresh/cli
+    commands:
+    - cf_export LAST_DEPLOYMENT_STATUS=$(codefresh get builds --pipeline-name="codefresh-io/pipelines/cd" --limit 2 --pipeline-trigger-id ${{CF_PIPELINE_TRIGGER_ID}} | awk '{print $3}' | egrep -v "STATUS|no available"|awk 'END{print}')
+    when:
+      condition:
+        all:
+          onlyProduction: '"${{ENVIRONMENT}}" == "production"'
+
+  should_wait_for_approve:
+    type: pending-approval
+    title: Should we deploy to prod
+    stage: prepare
+    when:
+      condition:
+        all:
+          onlyProduction: '"${{ENVIRONMENT}}" == "production"'
+          invalidDeploymentState : '"${{LAST_DEPLOYMENT_STATUS}}" != "success"'
+
+  continue_depolyment:
+    image: alpine:3.8
+    title: 'Continuing to deploy'
+    stage: prepare
+    commands:
+    - echo "Approved"
+    when:
+      steps:
+      - name: should_wait_for_approve
+        on:
+        - approved
+
+  validate_environment:
+    stage: prepare
+    title: 'Prepare environment variables'
+    image: codefresh/cli
+    commands:
+    # ensure ENVIRONMENT is set, exit if not
+    - |
+      # if trigger from cf-helm update production
+      # if [[ $CF_REPO_NAME == "cf-helm" ]]
+      # then
+      #   export ENVIRONMENT="production"
+      #   cf_export ENVIRONMENT=$CF_BRANCH
+      # fi
+      cf_export COMMIT_TO_CF_HELM=true
+      if [ -z "$ENVIRONMENT" ]
+      then echo "environment is not set" && exit 1
+      else echo "deploying to $ENVIRONMENT"
+      fi # environment is the relevant branch
+
+  main_clone:
+    stage: prepare
+    title: 'Cloning main repository...'
+    type: git-clone
+    repo: codefresh-io/cf-helm
+    revision: ${{ENVIRONMENT}}
+    git: cf_github
+
+  deploy_to_saas_environment:
+    stage: deploy
+    image: codefresh/cf-env-creator:2.12.0
+    commands:
+    - |
+      echo "Running command helm init --client-only"
+      helm init --client-only
+      echo "Running command helm repo add codefresh-dev http://chartmuseum-dev.codefresh.io"
+      helm repo add codefresh-dev http://chartmuseum-dev.codefresh.io
+      echo "Running command helm repo add codefresh http://chartmuseum.codefresh.io"
+      helm repo add codefresh http://chartmuseum.codefresh.io
+      echo "Saving old requirements.lock"
+      [ -f codefresh/requirements.lock ] && cat codefresh/requirements.lock > codefresh/oldRequirements.lock
+      echo "Removing old requirements.lock" #https://github.com/helm/helm/issues/2731
+      [ -f codefresh/requirements.lock ] && rm codefresh/requirements.lock
+      echo "Running command bash -c bin/deploy-saas $DEPLOYED_SERVICES"
+      bash -c "bin/deploy-saas $DEPLOYED_SERVICES"
+
+  commit_requirement_lock:
+    stage: deploy
+    image: codefresh/cli
+    commands:
+    - |
+      # get the github credentials
+      codefresh get ctx cf_github --decrypt -o yaml > github.yaml
+      export GITHUB_TOKEN=$(yq -r ".spec.data.auth.password" github.yaml)
+      git remote add remote https://$GITHUB_TOKEN@github.com/codefresh-io/cf-helm.git || true
+      # echo '[$JIRA_TICKET_TITLE](https://codefresh-io.atlassian.net/browse/$JIRA_TICKET_ID)' | cat - README.md > temp && mv temp README.md
+      git config --global user.email "automation@codefresh.io"
+      git config --global user.name $CF_BUILD_INITIATOR
+      git pull remote $ENVIRONMENT
+      git diff-index --quiet HEAD || git commit -am "Update $ENVIRONMENT by $CF_BUILD_INITIATOR"
+      git push remote
+    when:
+      condition:
+        all:
+          commitChangesToCfHelm: '"${{COMMIT_TO_CF_HELM}}" == "true"'
+          
+  create_deployment_mark_for_newrelic:
+      title: "Creating deployment mark for new relic"
+      stage: deploy
+      image: node:10.15.3-alpine
+      fail_fast: false
+      commands:
+      - |
+        apk update
+        apk add git
+        apk add curl
+        cd codefresh
+        git clone https://${{GITHUB_TOKEN}}@github.com/codefresh-io/pipelines.git || true
+        cd pipelines/scripts/cd
+        yarn install
+        OLD_REQUIREMENTS='/codefresh/volume/cf-helm/codefresh/oldRequirements.lock' NEW_REQUIREMENTS='/codefresh/volume/cf-helm/codefresh/requirements.lock' NEW_RELIC_API_KEY=${{NEW_RELIC_API_KEY}} CF_BUILD_INITIATOR=$CF_BUILD_INITIATOR node deploymentMarkers.js
+
+      when:
+        condition:
+          all:
+            commitChangesToCfHelm: '"${{COMMIT_TO_CF_HELM}}" == "true"'
+            onlyProduction: '"${{ENVIRONMENT}}" == "production"'
+            
+            
+  prepare_slack_message:
+      title: "Preparing slack message"
+      stage: notifications
+      image: node:10.15.3-alpine
+      fail_fast: false
+      commands:
+      - |
+        apk update
+        apk add git
+        apk add curl
+        cd codefresh
+        git clone https://${{GITHUB_TOKEN}}@github.com/codefresh-io/pipelines.git || true
+        cd pipelines/scripts/cd
+        yarn install
+        OLD_REQUIREMENTS='/codefresh/volume/cf-helm/codefresh/oldRequirements.lock' NEW_REQUIREMENTS='/codefresh/volume/cf-helm/codefresh/requirements.lock' ENVIRONMENT=${{ENVIRONMENT}} CF_BUILD_INITIATOR=$CF_BUILD_INITIATOR node slackNotifications.js > /codefresh/volume/cf-helm/codefresh/slackMessage.txt
+        cat /codefresh/volume/cf-helm/codefresh/slackMessage.txt
+
+      when:
+        condition:
+          all:
+            commitChangesToCfHelm: '"${{COMMIT_TO_CF_HELM}}" == "true"'
+
+  send_message_to_slack:
+    # channel cf-helm-notification
+    stage: notifications
+    title: Sending message to slack
+    image: codefresh/slack-message-sender
+    environment:
+    - WEBHOOK_URL=https://hooks.slack.com/services/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
+    commands:
+    - slack-message-sender send --message "$(cat /codefresh/volume/cf-helm/codefresh/slackMessage.txt)"
+    retry:
+      maxAttempts: 10
+      delay: 5
+      exponentialFactor: 2
+
